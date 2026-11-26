@@ -3,7 +3,7 @@
    (AI-Assisted Recruitment and Internship Portal)
    Script khởi tạo cơ sở dữ liệu - Microsoft SQL Server 2019+
    Nguồn: "Database Design - AI-Assisted Recruitment & Internship Portal"
-          và ERD.drawio (38 bảng, 66 mối quan hệ)
+          và ERD.drawio (39 bảng, 67 mối quan hệ)
 
    Quy ước
    - Khóa chính: UNIQUEIDENTIFIER lưu giá trị UUIDv7 do ứng dụng tạo
@@ -284,6 +284,71 @@ CREATE TABLE dbo.EmailOutbox (
 );
 CREATE CLUSTERED INDEX CX_EmailOutbox_Status_CreatedAt ON dbo.EmailOutbox (Status, CreatedAt);
 CREATE INDEX IX_EmailOutbox_UserId ON dbo.EmailOutbox (UserId);
+GO
+
+-- AuditLogs: Nhật ký hoạt động toàn hệ thống cho quản trị viên truy vết: ai đã làm gì, trên bản ghi nào, lúc nào, từ đâu và thay đổi những gì.
+-- Ghi tự động mọi thao tác thêm / sửa / xóa dữ liệu (EF Core SaveChanges interceptor), sự kiện đăng nhập / bảo mật,
+-- và việc xem dữ liệu cá nhân nhạy cảm (xem / tải CV, xem SĐT / email). Chỉ thêm, không sửa, không xóa (trừ job dọn dữ liệu sau 24 tháng).
+-- Không lưu mật khẩu băm, security stamp, token, nội dung CV, nội dung email; SĐT và email được che bớt.
+-- Lưu ý: không dùng LEDGER (APPEND_ONLY) vì bảng ledger append-only không cho DELETE, mâu thuẫn với quy định lưu giữ 24 tháng.
+CREATE TABLE dbo.AuditLogs (
+    Id              UNIQUEIDENTIFIER NOT NULL,  -- Khóa chính (UUIDv7 do ứng dụng sinh)
+    OccurredAt      DATETIME2(3)   NOT NULL CONSTRAINT DF_AuditLogs_OccurredAt DEFAULT (SYSUTCDATETIME()),  -- Thời điểm xảy ra (UTC, đến mili giây)
+    UserId          UNIQUEIDENTIFIER NULL,      -- Người thực hiện; NULL = khách chưa đăng nhập hoặc hệ thống
+    ActorRole       VARCHAR(20)    NULL,        -- Vai trò của người thực hiện tại thời điểm đó. Admin, Employer, Student
+    ActorType       TINYINT        NOT NULL,    -- Loại tác nhân. 1 User, 2 Anonymous, 3 System, 4 BackgroundJob
+    Category        TINYINT        NOT NULL,    -- Nhóm sự kiện. 1 Data, 2 Auth, 3 Security, 4 PersonalDataAccess
+    Action          VARCHAR(40)    NOT NULL,    -- Hành động. Create, Update, Delete, SoftDelete, Login, LoginFailed, Logout, PasswordReset, RoleChanged, StatusChange, Approve, Reject, Suspend, Export, ViewCV, DownloadCV, ViewContact, ViewAuditLog
+    EntityType      VARCHAR(64)    NULL,        -- Tên bảng / đối tượng bị tác động (vd. JobPostings)
+    EntityId        NVARCHAR(128)  NULL,        -- Khóa của bản ghi bị tác động (dạng chuỗi vì có khóa mã số và khóa ghép)
+    OldValues       NVARCHAR(MAX)  NULL,        -- Giá trị cũ (JSON), chỉ các cột đã đổi
+    NewValues       NVARCHAR(MAX)  NULL,        -- Giá trị mới (JSON), chỉ các cột đã đổi
+    ChangedColumns  NVARCHAR(1000) NULL,        -- Danh sách cột đã thay đổi, cách nhau bởi dấu phẩy (chỉ để hiển thị / lọc nhanh)
+    IpAddress       VARCHAR(45)    NULL,        -- Địa chỉ IP (IPv4 / IPv6)
+    UserAgent       NVARCHAR(512)  NULL,        -- Trình duyệt / thiết bị
+    RequestPath     NVARCHAR(400)  NULL,        -- Đường dẫn yêu cầu (vd. /employer/postings/edit)
+    HttpMethod      VARCHAR(10)    NULL,        -- Phương thức HTTP (GET, POST, PUT, DELETE)
+    CorrelationId   VARCHAR(64)    NULL,        -- Mã gom nhóm các thay đổi do cùng một thao tác gây ra (TraceId của request)
+    Success         BIT            NOT NULL CONSTRAINT DF_AuditLogs_Success DEFAULT (1),  -- Thao tác thành công hay thất bại
+    ErrorMessage    NVARCHAR(1000) NULL,        -- Lý do thất bại (nếu có)
+    CONSTRAINT PK_AuditLogs PRIMARY KEY NONCLUSTERED (Id),
+    CONSTRAINT FK_AuditLogs_Users FOREIGN KEY (UserId) REFERENCES dbo.Users (Id),
+    CONSTRAINT CK_AuditLogs_ActorType CHECK (ActorType BETWEEN 1 AND 4),
+    CONSTRAINT CK_AuditLogs_Category CHECK (Category BETWEEN 1 AND 4),
+    CONSTRAINT CK_AuditLogs_UserForUserActor CHECK (ActorType <> 1 OR UserId IS NOT NULL),
+    CONSTRAINT CK_AuditLogs_OldValuesJson CHECK (OldValues IS NULL OR ISJSON(OldValues) = 1),
+    CONSTRAINT CK_AuditLogs_NewValuesJson CHECK (NewValues IS NULL OR ISJSON(NewValues) = 1),
+    CONSTRAINT CK_AuditLogs_EntityPair CHECK ((EntityType IS NULL AND EntityId IS NULL) OR EntityType IS NOT NULL)
+);
+-- Sắp xếp vật lý theo thời gian: ghi nối nhanh, lọc theo khoảng ngày và dọn dữ liệu cũ hiệu quả
+CREATE CLUSTERED INDEX CX_AuditLogs_OccurredAt ON dbo.AuditLogs (OccurredAt);
+-- "Người dùng X đã làm gì"
+CREATE INDEX IX_AuditLogs_User ON dbo.AuditLogs (UserId, OccurredAt DESC) INCLUDE (Action, EntityType, EntityId);
+-- "Lịch sử của bản ghi Y" (timeline)
+CREATE INDEX IX_AuditLogs_Entity ON dbo.AuditLogs (EntityType, EntityId, OccurredAt DESC) INCLUDE (UserId, Action);
+-- Lọc theo nhóm / hành động (vd. mọi lần đăng nhập thất bại)
+CREATE INDEX IX_AuditLogs_Category_Action ON dbo.AuditLogs (Category, Action, OccurredAt DESC) INCLUDE (UserId, Success);
+-- Truy vết theo IP và theo thao tác
+CREATE INDEX IX_AuditLogs_Ip ON dbo.AuditLogs (IpAddress, OccurredAt DESC) WHERE IpAddress IS NOT NULL;
+CREATE INDEX IX_AuditLogs_Correlation ON dbo.AuditLogs (CorrelationId) WHERE CorrelationId IS NOT NULL;
+GO
+
+-- Thủ tục dọn nhật ký cũ hơn @MonthsToKeep tháng (mặc định 24). Xóa theo lô để không khóa bảng lâu.
+-- Chỉ role AuditRetention (tài khoản của SQL Agent job) được chạy; ứng dụng không có quyền này.
+CREATE PROCEDURE dbo.usp_PurgeAuditLogs
+    @MonthsToKeep INT = 24,
+    @BatchSize    INT = 5000
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @Cutoff DATETIME2(3) = DATEADD(MONTH, -@MonthsToKeep, SYSUTCDATETIME());
+    DECLARE @Rows INT = 1;
+    WHILE @Rows > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM dbo.AuditLogs WHERE OccurredAt < @Cutoff;
+        SET @Rows = @@ROWCOUNT;
+    END
+END
 GO
 
 /* =====================================================================
@@ -889,6 +954,25 @@ INSERT INTO dbo.Skills (Id, Name, NormalizedName, Category, IsApproved) VALUES
  ('0193a000-0000-7000-8000-000000000208', N'Giao tiếp',     N'GIAO TIẾP',     2, 1),
  ('0193a000-0000-7000-8000-000000000209', N'Làm việc nhóm', N'LÀM VIỆC NHÓM', 2, 1),
  ('0193a000-0000-7000-8000-000000000210', N'Tiếng Anh',     N'TIẾNG ANH',     3, 1);
+GO
+
+/* =====================================================================
+   PHÂN QUYỀN CHO NHẬT KÝ HOẠT ĐỘNG
+   - AppRuntime: role của tài khoản ứng dụng. Được đọc / ghi mọi bảng,
+     nhưng với AuditLogs chỉ được SELECT và INSERT (không UPDATE / DELETE).
+   - AuditRetention: role của SQL Agent job dọn nhật ký, chỉ được chạy
+     dbo.usp_PurgeAuditLogs.
+   Sau khi tạo login cho ứng dụng / job, gán vào role, ví dụ:
+     CREATE USER RecruitmentApp FOR LOGIN RecruitmentApp;
+     ALTER ROLE AppRuntime ADD MEMBER RecruitmentApp;
+   ===================================================================== */
+
+CREATE ROLE AppRuntime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::dbo TO AppRuntime;
+DENY UPDATE, DELETE ON dbo.AuditLogs TO AppRuntime;
+
+CREATE ROLE AuditRetention;
+GRANT EXECUTE ON dbo.usp_PurgeAuditLogs TO AuditRetention;
 GO
 
 PRINT N'RecruitmentPortal database created.';
